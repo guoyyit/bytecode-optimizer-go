@@ -1,0 +1,37 @@
+func main 0 2
+  push 1
+  push 2
+  add
+  print # line=2
+  push 42
+  pop
+  push 0
+  store 1 sum # line=4
+  push 1
+  store 0 i # line=5
+label loop
+  load 0 i # line=6
+  push 11
+  ge
+  jnz done
+  load 0 i # line=8
+  call square 1
+  load 1 sum
+  add
+  store 1 sum # line=9
+  load 0 i # line=10
+  push 1
+  add
+  store 0 i # line=11
+  jmp loop
+label done
+  load 1 sum
+  print # line=13
+  halt
+end
+func square 1 1
+  load 0 x # line=17
+  load 0 x # line=17
+  mul
+  ret
+end
