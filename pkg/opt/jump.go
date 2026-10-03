@@ -3,10 +3,15 @@ package opt
 import "github.com/guoyyit/bytecode-optimizer-go/pkg/ir"
 
 // passJumpFold performs two semantics-preserving rewrites:
-
+//
 //  1. Chain folding: "JMP A" where A is immediately "JMP B" (labels between
 //     them allowed) is rewritten to "JMP B". Conditional jumps follow the
-//     same chain.
+//     same chain. Chains form a functional graph (every label has at most one
+//     outgoing chain edge), so each label's final target is resolved exactly
+//     once and memoized: a whole pass is linear in the function size, no
+//     matter how deep the chains are. A label on a reference cycle resolves
+//     to itself and a label leading into a cycle resolves to the cycle
+//     entry, so cyclic programs converge instead of spinning.
 //  2. Redundant JMP removal: "JMP L" whose target is exactly where control
 //     would continue anyway is deleted.
 //
@@ -14,37 +19,81 @@ import "github.com/guoyyit/bytecode-optimizer-go/pkg/ir"
 // keep every jump target correct after instructions are deleted or reordered.
 func passJumpFold(f *ir.Func) Stats {
 	st := Stats{Name: PassJump}
+	code := f.Code
 
-	chainTarget := func(name string) string {
-		seen := map[string]bool{}
+	// nextInChain maps a label to the target of the JMP that immediately
+	// follows it (labels in between allowed). One sweep: every label run
+	// remembers the JMP that terminates it.
+	nextInChain := map[string]string{}
+	var pending []string
+	for _, ins := range code {
+		if ins.Op == ir.OpLabel {
+			pending = append(pending, ins.Text)
+			continue
+		}
+		if ins.Op == ir.OpJmp {
+			for _, name := range pending {
+				nextInChain[name] = ins.Text
+			}
+		}
+		pending = pending[:0]
+	}
+
+	// resolve returns the final target of the chain starting at a label,
+	// memoized per label. Resolution is iterative and detects cycles with an
+	// on-path index, so even self-referential chains terminate.
+	memo := make(map[string]string, len(nextInChain))
+	resolve := func(start string) string {
+		if dst, ok := memo[start]; ok {
+			return dst
+		}
+		var path []string
+		onPath := map[string]int{}
+		cur := start
 		for {
-			if seen[name] {
-				return name // defensive: chain cycles are rejected by Validate
+			if dst, ok := memo[cur]; ok {
+				for _, name := range path {
+					memo[name] = dst
+				}
+				return dst
 			}
-			seen[name] = true
-			pos := findLabel(f.Code, name)
-			if pos < 0 {
-				return name
+			next, ok := nextInChain[cur]
+			if !ok {
+				memo[cur] = cur
+				for _, name := range path {
+					memo[name] = cur
+				}
+				return cur
 			}
-			next := skipLabels(f.Code, pos+1)
-			if next >= len(f.Code) || f.Code[next].Op != ir.OpJmp {
-				return name
+			if j, cyc := onPath[cur]; cyc {
+				// Cycle: members resolve to themselves, the labels leading
+				// into it resolve to the cycle entry.
+				memo[cur] = cur
+				for _, name := range path[j:] {
+					memo[name] = name
+				}
+				for _, name := range path[:j] {
+					memo[name] = cur
+				}
+				return cur
 			}
-			name = f.Code[next].Text
+			onPath[cur] = len(path)
+			path = append(path, cur)
+			cur = next
 		}
 	}
 
-	out := make([]ir.Instr, 0, len(f.Code))
-	for i := 0; i < len(f.Code); i++ {
-		ins := f.Code[i]
+	out := make([]ir.Instr, 0, len(code))
+	for i := 0; i < len(code); i++ {
+		ins := code[i]
 		switch ins.Op {
 		case ir.OpJmp, ir.OpJz, ir.OpJnz:
-			dst := chainTarget(ins.Text)
+			dst := resolve(ins.Text)
 			if dst != ins.Text {
 				ins.Text = dst
 				st.changed = true
 			}
-			if ins.Op == ir.OpJmp && redundantFallthrough(out, f.Code[i+1:], dst) {
+			if ins.Op == ir.OpJmp && redundantFallthrough(out, code[i+1:], dst) {
 				st.Removed++
 				st.changed = true
 				continue
@@ -75,20 +124,4 @@ func redundantFallthrough(out []ir.Instr, tail []ir.Instr, dst string) bool {
 		}
 	}
 	return true
-}
-
-func findLabel(code []ir.Instr, name string) int {
-	for i, ins := range code {
-		if ins.Op == ir.OpLabel && ins.Text == name {
-			return i
-		}
-	}
-	return -1
-}
-
-func skipLabels(code []ir.Instr, from int) int {
-	for from < len(code) && code[from].Op == ir.OpLabel {
-		from++
-	}
-	return from
 }

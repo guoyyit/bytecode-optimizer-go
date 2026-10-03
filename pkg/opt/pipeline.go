@@ -157,17 +157,15 @@ func Optimize(p *ir.Program, cfg Config) (*ir.Program, *Report) {
 
 		report.Iterations = iter
 		if !changed {
-			// One final unused-label cleanup is not semantics-affecting; the
-			// last pass list ends with DCE, which keeps labels. Prune labels
-			// no jump references so stable output does not carry dead markers.
-			finalized := pruneLabels(work)
-			if err := Validate(finalized); err != nil {
-				return rollback(p, report, FailureInternal,
-					"label pruning produced invalid bytecode: "+err.Error())
-			}
+			// A full iteration changed nothing: every enabled pass is at its
+			// own fixed point on this program, so the output is a true fixed
+			// point of the whole pipeline. No transformation may happen after
+			// this check — anything that mutates the program must run inside
+			// the loop as a counted pass, or the result would not be stable
+			// under re-optimization.
 			report.Stable = true
-			report.CostAfter = programCost(finalized)
-			return finalized, report
+			report.CostAfter = programCost(work)
+			return work, report
 		}
 		if iter == maxIterations {
 			return rollback(p, report, FailureInternal,
@@ -216,28 +214,4 @@ func programCost(p *ir.Program) int64 {
 		c += FuncCost(f)
 	}
 	return c
-}
-
-// pruneLabels removes label markers that no jump references. Labels keep
-// jump targets relocatable throughout the pipeline; only after the fixed point
-// is reached can unreferenced markers disappear without affecting anything.
-func pruneLabels(p *ir.Program) *ir.Program {
-	out := p.Clone()
-	for _, f := range out.Funcs {
-		used := map[string]bool{}
-		for _, ins := range f.Code {
-			if ins.Op == ir.OpJmp || ins.Op == ir.OpJz || ins.Op == ir.OpJnz {
-				used[ins.Text] = true
-			}
-		}
-		code := f.Code[:0]
-		for _, ins := range f.Code {
-			if ins.Op == ir.OpLabel && !used[ins.Text] {
-				continue
-			}
-			code = append(code, ins)
-		}
-		f.Code = code
-	}
-	return out
 }
