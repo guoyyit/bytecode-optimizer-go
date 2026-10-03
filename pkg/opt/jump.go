@@ -14,29 +14,66 @@ import "github.com/guoyyit/bytecode-optimizer-go/pkg/ir"
 // keep every jump target correct after instructions are deleted or reordered.
 func passJumpFold(f *ir.Func) Stats {
 	st := Stats{Name: PassJump}
+	code := f.Code
+	n := len(code)
 
-	chainTarget := func(name string) string {
-		seen := map[string]bool{}
-		for {
-			if seen[name] {
-				return name // defensive: chain cycles are rejected by Validate
-			}
-			seen[name] = true
-			pos := findLabel(f.Code, name)
-			if pos < 0 {
-				return name
-			}
-			next := skipLabels(f.Code, pos+1)
-			if next >= len(f.Code) || f.Code[next].Op != ir.OpJmp {
-				return name
-			}
-			name = f.Code[next].Text
+	// Label index: name -> position, built once so chain following is O(1)
+	// per step instead of a linear scan over every instruction.
+	labelPos := make(map[string]int, n)
+	for i, ins := range code {
+		if ins.Op == ir.OpLabel {
+			labelPos[ins.Text] = i
 		}
 	}
 
-	out := make([]ir.Instr, 0, len(f.Code))
-	for i := 0; i < len(f.Code); i++ {
-		ins := f.Code[i]
+	// chainTarget returns the final label of the jump chain starting at
+	// name. It memoizes results so each label is followed at most once:
+	// following l0->l1->...->ln populates the answer for every link.
+	memo := make(map[string]string, len(labelPos))
+	var chainTarget func(string) string
+	chainTarget = func(name string) string {
+		if end, ok := memo[name]; ok {
+			return end
+		}
+		path := make([]string, 0, 8)
+		cur := name
+		for {
+			if end, ok := memo[cur]; ok {
+				for _, p := range path {
+					memo[p] = end
+				}
+				return end
+			}
+			for _, p := range path {
+				if p == cur {
+					for _, q := range path {
+						memo[q] = cur
+					}
+					return cur
+				}
+			}
+			path = append(path, cur)
+			pos, ok := labelPos[cur]
+			if !ok {
+				for _, p := range path {
+					memo[p] = cur
+				}
+				return cur
+			}
+			next := skipLabels(code, pos+1)
+			if next >= n || code[next].Op != ir.OpJmp {
+				for _, p := range path {
+					memo[p] = cur
+				}
+				return cur
+			}
+			cur = code[next].Text
+		}
+	}
+
+	out := make([]ir.Instr, 0, n)
+	for i := 0; i < n; i++ {
+		ins := code[i]
 		switch ins.Op {
 		case ir.OpJmp, ir.OpJz, ir.OpJnz:
 			dst := chainTarget(ins.Text)
@@ -44,7 +81,7 @@ func passJumpFold(f *ir.Func) Stats {
 				ins.Text = dst
 				st.changed = true
 			}
-			if ins.Op == ir.OpJmp && redundantFallthrough(out, f.Code[i+1:], dst) {
+			if ins.Op == ir.OpJmp && redundantFallthrough(out, code[i+1:], dst) {
 				st.Removed++
 				st.changed = true
 				continue
@@ -75,15 +112,6 @@ func redundantFallthrough(out []ir.Instr, tail []ir.Instr, dst string) bool {
 		}
 	}
 	return true
-}
-
-func findLabel(code []ir.Instr, name string) int {
-	for i, ins := range code {
-		if ins.Op == ir.OpLabel && ins.Text == name {
-			return i
-		}
-	}
-	return -1
 }
 
 func skipLabels(code []ir.Instr, from int) int {
